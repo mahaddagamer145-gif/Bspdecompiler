@@ -7,9 +7,9 @@ endif()
 project(bspdecompiler LANGUAGES CXX)
 
 add_executable(bspdecompiler
-    src/main.cpp
-    src/bsp.cpp
-    src/decompile.cpp
+    main.cpp
+    bsp.cpp
+    decompile.cpp
 )
 
 target_compile_features(bspdecompiler PRIVATE cxx_std_17)
