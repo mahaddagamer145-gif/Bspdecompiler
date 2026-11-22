@@ -83,34 +83,38 @@ void keyValue(std::ostream& output, int depth, const std::string& key,
            << quoted(key) << ' ' << quoted(value) << '\n';
 }
 
-Polygon sidePolygon(const BspFile& bsp, const Brush& brush, int sideIndex) {
+Polygon sidePolygon(const BspFile& bsp, const Brush& brush, int sideIndex,
+                    bool crunch = true) {
     const auto& baseSide =
         bsp.brushSides[static_cast<std::size_t>(brush.firstSide + sideIndex)];
     if (baseSide.plane >= bsp.planes.size()) {
         return {};
     }
     const auto& plane = bsp.planes[baseSide.plane];
-    const double normalLengthSquared = plane.normal.dot(plane.normal);
-    if (normalLengthSquared < 1e-12) {
+    const std::array<double, 3> normalComponents{
+        plane.normal.x, plane.normal.y, plane.normal.z};
+    int dominantAxis = 0;
+    for (int axis = 1; axis < 3; ++axis) {
+        if (std::abs(normalComponents[static_cast<std::size_t>(axis)]) >
+            std::abs(normalComponents[static_cast<std::size_t>(dominantAxis)])) {
+            dominantAxis = axis;
+        }
+    }
+    if (plane.normal.length() < 1e-12) {
         return {};
     }
 
-    const Vec3 origin = plane.normal * (plane.distance / normalLengthSquared);
-    Vec3 up = std::abs(plane.normal.z) < 0.707
-                  ? Vec3{0.0, 0.0, 1.0}
-                  : Vec3{1.0, 0.0, 0.0};
-    up = up - plane.normal * (up.dot(plane.normal) / normalLengthSquared);
+    const Vec3 origin = plane.normal * plane.distance;
+    Vec3 up = dominantAxis == 2 ? Vec3{1.0, 0.0, 0.0}
+                                : Vec3{0.0, 0.0, 1.0};
+    up = up - plane.normal * up.dot(plane.normal);
     const double upLength = up.length();
     if (upLength < 1e-12) {
         return {};
     }
     up = up * (WindExtent / upLength);
     Vec3 right = up.cross(plane.normal);
-    const double rightLength = right.length();
-    if (rightLength < 1e-12) {
-        return {};
-    }
-    right = right * (WindExtent / rightLength);
+    right = right * WindExtent;
     Polygon polygon{origin - right + up, origin + right + up,
                     origin + right - up, origin - right - up};
 
@@ -126,6 +130,15 @@ Polygon sidePolygon(const BspFile& bsp, const Brush& brush, int sideIndex) {
         const auto& clippingPlane = bsp.planes[otherSide.plane];
         Polygon clipped;
         clipped.reserve(polygon.size() + 1);
+        const auto classify = [](double distance) {
+            if (distance > ClipEpsilon) {
+                return 1;
+            }
+            if (distance < -ClipEpsilon) {
+                return 0;
+            }
+            return 2;
+        };
         for (std::size_t vertex = 0; vertex < polygon.size(); ++vertex) {
             const Vec3& current = polygon[vertex];
             const Vec3& next = polygon[(vertex + 1) % polygon.size()];
@@ -133,13 +146,14 @@ Polygon sidePolygon(const BspFile& bsp, const Brush& brush, int sideIndex) {
                 clippingPlane.normal.dot(current) - clippingPlane.distance;
             const double nextDistance =
                 clippingPlane.normal.dot(next) - clippingPlane.distance;
-            const bool currentInside = currentDistance <= ClipEpsilon;
-            const bool nextInside = nextDistance <= ClipEpsilon;
+            const int currentSide = classify(currentDistance);
+            const int nextSide = classify(nextDistance);
 
-            if (currentInside) {
+            if (currentSide == 0 || currentSide == 2) {
                 clipped.push_back(current);
             }
-            if (currentInside != nextInside) {
+            if (currentSide != 2 && nextSide != 2 &&
+                currentSide != nextSide) {
                 const double denominator = currentDistance - nextDistance;
                 if (std::abs(denominator) > 1e-12) {
                     const double fraction = currentDistance / denominator;
@@ -148,6 +162,10 @@ Polygon sidePolygon(const BspFile& bsp, const Brush& brush, int sideIndex) {
             }
         }
         polygon = std::move(clipped);
+    }
+
+    if (!crunch) {
+        return polygon;
     }
 
     Polygon clean;
@@ -205,6 +223,47 @@ bool windingsMatch(const Polygon& first, const Polygon& second) {
         bestDistance = std::min(bestDistance, distance);
     }
     return bestDistance < 0.5;
+}
+
+bool polygonContains(const Polygon& outer, const Polygon& inner,
+                     const Plane& plane) {
+    if (outer.size() < 3 || inner.empty()) {
+        return false;
+    }
+
+    Vec3 center;
+    for (const auto& point : outer) {
+        center = center + point;
+    }
+    center = center * (1.0 / static_cast<double>(outer.size()));
+    const double normalLength = plane.normal.length();
+    if (normalLength < 1e-12) {
+        return false;
+    }
+    const Vec3 normal = plane.normal * (1.0 / normalLength);
+    constexpr double tolerance = 0.5;
+
+    for (const auto& point : inner) {
+        if (std::abs(normal.dot(point) - plane.distance / normalLength) >
+            tolerance) {
+            return false;
+        }
+        for (std::size_t edge = 0; edge < outer.size(); ++edge) {
+            const auto& start = outer[edge];
+            const auto edgeVector = outer[(edge + 1) % outer.size()] - start;
+            const double edgeLength = edgeVector.length();
+            if (edgeLength < 1e-8) {
+                continue;
+            }
+            const double centerSide = edgeVector.cross(center - start).dot(normal);
+            const double pointSide = edgeVector.cross(point - start).dot(normal);
+            if ((centerSide >= 0.0 && pointSide < -tolerance * edgeLength) ||
+                (centerSide < 0.0 && pointSide > tolerance * edgeLength)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool choosePlanePoints(const Polygon& polygon, const Vec3& origin,
@@ -742,14 +801,25 @@ private:
             return bsp_.displacements[static_cast<std::size_t>(face.displacement)]
                 .sideId;
         }
-        if (face.originalFace < 0 ||
-            static_cast<std::size_t>(face.originalFace) >=
+        std::vector<Polygon> targetPolygons;
+        if (face.originalFace >= 0 &&
+            static_cast<std::size_t>(face.originalFace) <
                 bsp_.originalFaces.size()) {
+            auto original = facePolygon(
+                bsp_, bsp_.originalFaces[static_cast<std::size_t>(
+                          face.originalFace)]);
+            if (original.size() >= 3) {
+                targetPolygons.push_back(std::move(original));
+            }
+        }
+        auto current = facePolygon(bsp_, face);
+        if (current.size() >= 3) {
+            targetPolygons.push_back(std::move(current));
+        }
+        if (targetPolygons.empty()) {
             return -1;
         }
-        const auto original =
-            facePolygon(bsp_, bsp_.originalFaces[static_cast<std::size_t>(
-                                  face.originalFace)]);
+
         for (std::size_t brushIndex = 0; brushIndex < bsp_.brushes.size();
              ++brushIndex) {
             const auto& brush = bsp_.brushes[brushIndex];
@@ -761,9 +831,39 @@ private:
                     brushSideIds_[sideIndexGlobal] == 0) {
                     continue;
                 }
-                if (windingsMatch(
-                        sidePolygon(bsp_, brush, sideIndex), original)) {
-                    return static_cast<int>(brushSideIds_[sideIndexGlobal]);
+                const auto polygon =
+                    sidePolygon(bsp_, brush, sideIndex, false);
+                for (const auto& target : targetPolygons) {
+                    if (windingsMatch(polygon, target)) {
+                        return static_cast<int>(
+                            brushSideIds_[sideIndexGlobal]);
+                    }
+                }
+            }
+        }
+
+        if (face.plane >= bsp_.planes.size()) {
+            return -1;
+        }
+        const auto& plane = bsp_.planes[face.plane];
+        for (std::size_t brushIndex = 0; brushIndex < bsp_.brushes.size();
+             ++brushIndex) {
+            const auto& brush = bsp_.brushes[brushIndex];
+            for (int sideIndex = 0; sideIndex < brush.sideCount; ++sideIndex) {
+                const auto sideIndexGlobal =
+                    static_cast<std::size_t>(brush.firstSide + sideIndex);
+                const auto& side = bsp_.brushSides[sideIndexGlobal];
+                if (side.plane != face.plane || side.texinfo != face.texinfo ||
+                    brushSideIds_[sideIndexGlobal] == 0) {
+                    continue;
+                }
+                const auto polygon =
+                    sidePolygon(bsp_, brush, sideIndex, false);
+                for (const auto& target : targetPolygons) {
+                    if (polygonContains(polygon, target, plane)) {
+                        return static_cast<int>(
+                            brushSideIds_[sideIndexGlobal]);
+                    }
                 }
             }
         }
